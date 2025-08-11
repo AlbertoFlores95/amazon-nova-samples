@@ -1,5 +1,5 @@
-pyaudio>=0.2.13
+pyaudio>=0.2.11
+pytz>=2023.3
 rx>=3.2.0
 smithy-aws-core>=0.0.1
-pytz
 aws_sdk_bedrock_runtime

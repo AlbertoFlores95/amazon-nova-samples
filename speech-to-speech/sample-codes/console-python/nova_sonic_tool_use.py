@@ -11,6 +11,9 @@ import hashlib
 import datetime
 import time
 import inspect
+import wave
+import io
+import subprocess
 from aws_sdk_bedrock_runtime.client import BedrockRuntimeClient, InvokeModelWithBidirectionalStreamOperationInput
 from aws_sdk_bedrock_runtime.models import InvokeModelWithBidirectionalStreamInputChunk, BidirectionalInputPayloadPart
 from aws_sdk_bedrock_runtime.config import Config, HTTPAuthSchemeResolver, SigV4AuthScheme
@@ -425,6 +428,13 @@ class BedrockStreamManager:
         
         # Add tracking for in-progress tool calls
         self.pending_tool_tasks = {}
+        
+        # Audio recording callback
+        self.audio_recorder_callback = None
+
+    def set_audio_recorder_callback(self, callback):
+        """Set callback for audio recording events"""
+        self.audio_recorder_callback = callback
 
     def _initialize_client(self):
         """Initialize the Bedrock client."""
@@ -446,7 +456,7 @@ class BedrockStreamManager:
             self.stream_response = await time_it_async("invoke_model_with_bidirectional_stream", lambda : self.bedrock_client.invoke_model_with_bidirectional_stream( InvokeModelWithBidirectionalStreamOperationInput(model_id=self.model_id)))
             self.is_active = True
             default_system_prompt = "You are a friend. The user and you will engage in a spoken dialog exchanging the transcripts of a natural real-time conversation." \
-            "When reading order numbers, please read each digit individually, separated by pauses. For example, order #1234 should be read as 'order number one-two-three-four' rather than 'order number one thousand two hundred thirty-four'."
+            "When reading order numbers, please read each digit individually, separated by pauses. For example, order #1234 should be read as 'order number one-two-three-four' rather than 'order number one thousand two hundred thirty-four'. the team name is 'The-Kar-nels' and the slogan is 'Code-driven. Car-focused.'."
             
             # Send initialization events
             prompt_event = self.start_prompt()
@@ -643,6 +653,12 @@ class BedrockStreamManager:
                                     audio_content = json_data['event']['audioOutput']['content']
                                     audio_bytes = base64.b64decode(audio_content)
                                     await self.audio_output_queue.put(audio_bytes)
+                                    
+                                    # Start recording if this is the first audio chunk from assistant
+                                    if self.audio_recorder_callback and self.role == "ASSISTANT":
+                                        # Call the callback to start recording
+                                        if hasattr(self.audio_recorder_callback, 'start_recording_assistant'):
+                                            self.audio_recorder_callback.start_recording_assistant()
                                 elif 'toolUse' in json_data['event']:
                                     self.toolUseContent = json_data['event']['toolUse']
                                     self.toolName = json_data['event']['toolUse']['toolName']
@@ -655,6 +671,12 @@ class BedrockStreamManager:
                                     debug_print("Processing tool use asynchronously")
                                 elif 'contentEnd' in json_data['event']:
                                     debug_print("Content end")
+                                    
+                                    # Stop recording if this is the end of assistant content
+                                    if self.audio_recorder_callback and self.role == "ASSISTANT":
+                                        # Call the callback to stop recording and save MP3
+                                        if hasattr(self.audio_recorder_callback, 'stop_recording_assistant'):
+                                            self.audio_recorder_callback.stop_recording_assistant()
                                 elif 'completionEnd' in json_data['event']:
                                     # Handle end of conversation, no more response will be generated
                                     debug_print("End of response sequence")
@@ -762,6 +784,16 @@ class AudioStreamer:
         self.is_streaming = False
         self.loop = asyncio.get_event_loop()
 
+        # Audio recording for MP3 export
+        self.is_recording_assistant = False
+        self.assistant_audio_frames = []
+        self.recording_start_time = None
+        self.output_directory = "assistant_responses"
+        
+        # Create output directory if it doesn't exist
+        if not os.path.exists(self.output_directory):
+            os.makedirs(self.output_directory)
+
         # Initialize PyAudio
         debug_print("AudioStreamer Initializing PyAudio...")
         self.p = time_it("AudioStreamerInitPyAudio", pyaudio.PyAudio)
@@ -791,6 +823,82 @@ class AudioStreamer:
         ))
 
         debug_print("output audio stream opened")
+
+    def start_recording_assistant(self):
+        """Start recording assistant audio for MP3 export"""
+        self.is_recording_assistant = True
+        self.assistant_audio_frames = []
+        self.recording_start_time = datetime.datetime.now()
+        debug_print("Started recording assistant audio")
+
+    def stop_recording_assistant(self):
+        """Stop recording assistant audio and save as MP3"""
+        if not self.is_recording_assistant or not self.assistant_audio_frames:
+            return None
+        
+        self.is_recording_assistant = False
+        
+        try:
+            # Create timestamp for filename
+            timestamp = self.recording_start_time.strftime("%Y%m%d_%H%M%S")
+            filename = f"assistant_response_{timestamp}.mp3"
+            filepath = os.path.join(self.output_directory, filename)
+            
+            # Create temporary WAV file
+            temp_wav_path = os.path.join(self.output_directory, f"temp_{timestamp}.wav")
+            
+            # Convert audio frames to WAV format
+            with wave.open(temp_wav_path, 'wb') as wav_file:
+                wav_file.setnchannels(CHANNELS)
+                wav_file.setsampwidth(self.p.get_sample_size(FORMAT))
+                wav_file.setframerate(OUTPUT_SAMPLE_RATE)
+                wav_file.writeframes(b''.join(self.assistant_audio_frames))
+            
+            # Convert WAV to MP3 using ffmpeg
+            try:
+                subprocess.run([
+                    'ffmpeg', '-y',  # Overwrite output file
+                    '-i', temp_wav_path,  # Input WAV file
+                    '-acodec', 'mp3',  # MP3 codec
+                    '-ab', '128k',  # Bitrate
+                    filepath  # Output MP3 file
+                ], check=True, capture_output=True)
+                
+                # Remove temporary WAV file
+                os.remove(temp_wav_path)
+                
+                print(f"Assistant response saved as: {filepath}")
+                debug_print(f"Assistant response saved as MP3: {filepath}")
+                
+            except subprocess.CalledProcessError as e:
+                print(f"Error converting to MP3: {e}")
+                debug_print(f"Error converting to MP3: {e}")
+                # If ffmpeg fails, save as WAV instead
+                wav_filename = f"assistant_response_{timestamp}.wav"
+                wav_filepath = os.path.join(self.output_directory, wav_filename)
+                os.rename(temp_wav_path, wav_filepath)
+                print(f"Saved as WAV instead: {wav_filepath}")
+                return wav_filepath
+            except FileNotFoundError:
+                print("ffmpeg not found. Saving as WAV instead.")
+                debug_print("ffmpeg not found. Saving as WAV instead.")
+                # If ffmpeg is not available, save as WAV
+                wav_filename = f"assistant_response_{timestamp}.wav"
+                wav_filepath = os.path.join(self.output_directory, wav_filename)
+                os.rename(temp_wav_path, wav_filepath)
+                print(f"Saved as WAV: {wav_filepath}")
+                return wav_filepath
+            
+            # Clear the frames
+            self.assistant_audio_frames = []
+            self.recording_start_time = None
+            
+            return filepath
+            
+        except Exception as e:
+            print(f"Error saving assistant response: {e}")
+            debug_print(f"Error saving assistant response: {e}")
+            return None
 
     def input_callback(self, in_data, frame_count, time_info, status):
         """Callback function that schedules audio processing in the asyncio event loop"""
@@ -835,6 +943,10 @@ class AudioStreamer:
                 )
                 
                 if audio_data and self.is_streaming:
+                    # Record assistant audio if recording is enabled
+                    if self.is_recording_assistant:
+                        self.assistant_audio_frames.append(audio_data)
+                    
                     # Write directly to the output stream in smaller chunks
                     chunk_size = CHUNK_SIZE  # Use the same chunk size as the stream
                     
@@ -935,6 +1047,9 @@ async def main(debug=False):
 
     # Create audio streamer
     audio_streamer = AudioStreamer(stream_manager)
+    
+    # Connect the audio recorder callback
+    stream_manager.set_audio_recorder_callback(audio_streamer)
 
     # Initialize the stream
     await time_it_async("initialize_stream", stream_manager.initialize_stream)
@@ -956,11 +1071,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Nova Sonic Python Streaming')
     parser.add_argument('--debug', action='store_true', help='Enable debug mode')
     args = parser.parse_args()
-    # Set your AWS credentials here or use environment variables
-    # os.environ['AWS_ACCESS_KEY_ID'] = "AWS_ACCESS_KEY_ID"
-    # os.environ['AWS_SECRET_ACCESS_KEY'] = "AWS_SECRET_ACCESS_KEY"
-    # os.environ['AWS_DEFAULT_REGION'] = "us-east-1"
-
     # Run the main function
     try:
         asyncio.run(main(debug=args.debug))
