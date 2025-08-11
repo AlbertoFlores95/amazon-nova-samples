@@ -431,6 +431,11 @@ class BedrockStreamManager:
         
         # Audio recording callback
         self.audio_recorder_callback = None
+        
+        # Recording state management
+        self.is_recording_in_progress = False
+        self.assistant_response_started = False
+        self.current_response_id = None
 
     def set_audio_recorder_callback(self, callback):
         """Set callback for audio recording events"""
@@ -626,6 +631,21 @@ class BedrockStreamManager:
                                     content_start = json_data['event']['contentStart']
                                     # set role
                                     self.role = content_start['role']
+                                    
+                                    # Start recording if this is the beginning of assistant response
+                                    if self.role == "ASSISTANT" and not self.is_recording_in_progress:
+                                        # Generate a unique response ID to track this response
+                                        self.current_response_id = str(uuid.uuid4())
+                                        self.assistant_response_started = True
+                                        self.is_recording_in_progress = True
+                                        if self.audio_recorder_callback and hasattr(self.audio_recorder_callback, 'start_recording_assistant'):
+                                            self.audio_recorder_callback.start_recording_assistant()
+                                            debug_print(f"Started recording assistant response: {self.current_response_id}")
+                                    elif self.role == "ASSISTANT" and self.is_recording_in_progress:
+                                        # If we're already recording and get another assistant content start, 
+                                        # it means this is part of the same response, so continue recording
+                                        debug_print(f"Continuing recording for existing response: {self.current_response_id}")
+                                    
                                     # Check for speculative content
                                     if 'additionalModelFields' in content_start:
                                         try:
@@ -644,21 +664,33 @@ class BedrockStreamManager:
                                     if '{ "interrupted" : true }' in text_content:
                                         debug_print("Barge-in detected. Stopping audio output.")
                                         self.barge_in = True
+                                        
+                                        # Stop recording if barge-in occurs
+                                        if self.audio_recorder_callback and self.is_recording_in_progress:
+                                            if hasattr(self.audio_recorder_callback, 'stop_recording_assistant'):
+                                                self.audio_recorder_callback.stop_recording_assistant()
+                                                self.is_recording_in_progress = False
+                                                self.assistant_response_started = False
+                                                debug_print(f"Stopped recording due to barge-in: {self.current_response_id}")
+                                                self.current_response_id = None
 
                                     if (self.role == "ASSISTANT" and self.display_assistant_text):
                                         print(f"Assistant: {text_content}")
                                     elif (self.role == "USER"):
                                         print(f"User: {text_content}")
+                                        
+                                        # Stop recording if user starts speaking
+                                        if self.audio_recorder_callback and self.is_recording_in_progress:
+                                            if hasattr(self.audio_recorder_callback, 'stop_recording_assistant'):
+                                                self.audio_recorder_callback.stop_recording_assistant()
+                                                self.is_recording_in_progress = False
+                                                self.assistant_response_started = False
+                                                debug_print(f"Stopped recording due to user input: {self.current_response_id}")
+                                                self.current_response_id = None
                                 elif 'audioOutput' in json_data['event']:
                                     audio_content = json_data['event']['audioOutput']['content']
                                     audio_bytes = base64.b64decode(audio_content)
                                     await self.audio_output_queue.put(audio_bytes)
-                                    
-                                    # Start recording if this is the first audio chunk from assistant
-                                    if self.audio_recorder_callback and self.role == "ASSISTANT":
-                                        # Call the callback to start recording
-                                        if hasattr(self.audio_recorder_callback, 'start_recording_assistant'):
-                                            self.audio_recorder_callback.start_recording_assistant()
                                 elif 'toolUse' in json_data['event']:
                                     self.toolUseContent = json_data['event']['toolUse']
                                     self.toolName = json_data['event']['toolUse']['toolName']
@@ -672,14 +704,21 @@ class BedrockStreamManager:
                                 elif 'contentEnd' in json_data['event']:
                                     debug_print("Content end")
                                     
-                                    # Stop recording if this is the end of assistant content
-                                    if self.audio_recorder_callback and self.role == "ASSISTANT":
-                                        # Call the callback to stop recording and save MP3
-                                        if hasattr(self.audio_recorder_callback, 'stop_recording_assistant'):
-                                            self.audio_recorder_callback.stop_recording_assistant()
+                                    # Only stop recording on completionEnd, not on individual contentEnd events
+                                    # This ensures we capture the entire response as one continuous recording
+                                    debug_print("Content end detected (continuing recording)")
                                 elif 'completionEnd' in json_data['event']:
                                     # Handle end of conversation, no more response will be generated
                                     debug_print("End of response sequence")
+                                    
+                                    # Stop recording if we were recording and this is the end of the response
+                                    if self.audio_recorder_callback and self.is_recording_in_progress:
+                                        if hasattr(self.audio_recorder_callback, 'stop_recording_assistant'):
+                                            self.audio_recorder_callback.stop_recording_assistant()
+                                            self.is_recording_in_progress = False
+                                            self.assistant_response_started = False
+                                            debug_print(f"Stopped recording assistant response (completion end): {self.current_response_id}")
+                                            self.current_response_id = None
                                 elif 'usageEvent' in json_data['event']:
                                     debug_print(f"UsageEvent: {json_data['event']}")
                             # Put the response in the output queue for other components
@@ -701,6 +740,13 @@ class BedrockStreamManager:
         except Exception as e:
             print(f"Response processing error: {e}")
         finally:
+            # Stop recording if stream ends while recording
+            if self.audio_recorder_callback and self.is_recording_in_progress:
+                if hasattr(self.audio_recorder_callback, 'stop_recording_assistant'):
+                    self.audio_recorder_callback.stop_recording_assistant()
+                    debug_print(f"Stopped recording due to stream end: {self.current_response_id}")
+                    self.current_response_id = None
+            
             self.is_active = False
 
     def handle_tool_request(self, tool_name, tool_content, tool_use_id):
@@ -826,10 +872,13 @@ class AudioStreamer:
 
     def start_recording_assistant(self):
         """Start recording assistant audio for MP3 export"""
-        self.is_recording_assistant = True
-        self.assistant_audio_frames = []
-        self.recording_start_time = datetime.datetime.now()
-        debug_print("Started recording assistant audio")
+        if not self.is_recording_assistant:
+            self.is_recording_assistant = True
+            self.assistant_audio_frames = []
+            self.recording_start_time = datetime.datetime.now()
+            debug_print("Started recording assistant audio")
+        else:
+            debug_print("Recording already in progress, ignoring start request")
 
     def stop_recording_assistant(self):
         """Stop recording assistant audio and save as MP3"""
@@ -841,7 +890,13 @@ class AudioStreamer:
         try:
             # Create timestamp for filename
             timestamp = self.recording_start_time.strftime("%Y%m%d_%H%M%S")
-            filename = f"assistant_response_{timestamp}.mp3"
+            
+            # Get response ID from stream manager if available
+            response_id = ""
+            if hasattr(self.stream_manager, 'current_response_id') and self.stream_manager.current_response_id:
+                response_id = f"_{self.stream_manager.current_response_id[:8]}"  # Use first 8 chars of UUID
+            
+            filename = f"assistant_response_{timestamp}{response_id}.mp3"
             filepath = os.path.join(self.output_directory, filename)
             
             # Create temporary WAV file
@@ -899,6 +954,15 @@ class AudioStreamer:
             print(f"Error saving assistant response: {e}")
             debug_print(f"Error saving assistant response: {e}")
             return None
+
+    def reset_recording_state(self):
+        """Reset the recording state"""
+        self.is_recording_assistant = False
+        self.assistant_audio_frames = []
+        self.recording_start_time = None
+        if hasattr(self.stream_manager, 'current_response_id'):
+            self.stream_manager.current_response_id = None
+        debug_print("Recording state reset")
 
     def input_callback(self, in_data, frame_count, time_info, status):
         """Callback function that schedules audio processing in the asyncio event loop"""
@@ -1009,6 +1073,11 @@ class AudioStreamer:
         """Stop streaming audio."""
         if not self.is_streaming:
             return
+        
+        # Stop recording if still in progress
+        if self.is_recording_assistant:
+            self.stop_recording_assistant()
+            debug_print("Stopped recording due to application shutdown")
             
         self.is_streaming = False
 
