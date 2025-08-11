@@ -460,8 +460,7 @@ class BedrockStreamManager:
         try:
             self.stream_response = await time_it_async("invoke_model_with_bidirectional_stream", lambda : self.bedrock_client.invoke_model_with_bidirectional_stream( InvokeModelWithBidirectionalStreamOperationInput(model_id=self.model_id)))
             self.is_active = True
-            default_system_prompt = "You are a friend. The user and you will engage in a spoken dialog exchanging the transcripts of a natural real-time conversation." \
-            "When reading order numbers, please read each digit individually, separated by pauses. For example, order #1234 should be read as 'order number one-two-three-four' rather than 'order number one thousand two hundred thirty-four'. the team name is 'The-Kar-nels' and the slogan is 'Code-driven. Car-focused.'."
+            default_system_prompt = "You are a friend. The user and you will engage in a spoken dialog exchanging the transcripts of a natural real-time conversation.  the team name is 'The-Kar-nels' and the slogan is 'Code-driven. Car-focused.'."
             
             # Send initialization events
             prompt_event = self.start_prompt()
